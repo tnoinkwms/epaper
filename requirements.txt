@@ -1,0 +1,5 @@
+# Railway(Dockerfile)用。ローカルは server.py 先頭の PEP 723 ブロックを
+# uv が読むので、こちらは使わない。バージョンは両方揃えておくこと。
+flask>=3.0
+pillow>=10.0
+gunicorn>=22.0

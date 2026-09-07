@@ -1,0 +1,8 @@
+.git
+.gitignore
+.DS_Store
+__pycache__/
+*.pyc
+data/
+DEPLOY.md
+ESP32.ino

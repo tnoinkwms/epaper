@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.pyc
+data/
+
+# 同梱フォントは server.py が実際に使う Regular だけをコミットする。
+# 残り(静的9ウェイト + 可変フォント)で 51MB あり、Railway が
+# デプロイのたびに丸ごと取得することになるため。
+# 他のウェイトに切り替えるときは、ここから外して一緒にコミットすること。
+# ローカルのファイルは消していないので、外すだけで使える。
+Noto_Sans_JP/static/*
+!Noto_Sans_JP/static/NotoSansJP-Regular.ttf
+Noto_Sans_JP/NotoSansJP-VariableFont_wght.ttf
