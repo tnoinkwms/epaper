@@ -3,3 +3,6 @@
 flask>=3.0
 pillow>=10.0
 gunicorn>=22.0
+
+# bot.py 用。Webサービスでは使わないが、同じイメージを使うのでここに置く。
+discord.py>=2.3
