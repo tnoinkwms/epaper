@@ -669,9 +669,17 @@ PAGE = """
          border-radius:10px;line-height:0;max-width:100%}
  .screen img{width:200px;max-width:100%;height:auto;image-rendering:pixelated}
  .empty{color:var(--muted);font-size:13px;padding:40px 0}
+ /* touch-action:none で指のスクロール、user-select:none でドラッグ選択を止める。
+    pointerdown の preventDefault だけでは選択は止まらない。Pointer Events の
+    仕様上、pointerdown を打ち消しても互換の mousedown は発生し、
+    そこから文字選択が始まってしまうため。 */
  #pad{width:100%;max-width:240px;aspect-ratio:240/416;touch-action:none;
       background:#fff;border:1px solid var(--line);border-radius:10px;
-      display:block;margin:0 auto;cursor:crosshair}
+      display:block;margin:0 auto;cursor:crosshair;
+      -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+ /* キャンバスの外へドラッグが抜けたときに、周りの文字が選択されるのを防ぐ。
+    描いている間だけ付ける。 */
+ body.drawing,body.drawing *{-webkit-user-select:none;user-select:none}
  .pad-tools{display:flex;gap:8px;justify-content:center;margin:12px 0}
 </style>
 <body>
@@ -790,8 +798,13 @@ PAGE = """
    ctx.beginPath();
    ctx.moveTo(p[0], p[1]);
  }
+ function endStroke(){
+   drawing = false;
+   document.body.classList.remove('drawing');
+ }
  pad.addEventListener('pointerdown', function(e){
    drawing = true;
+   document.body.classList.add('drawing');
    pad.setPointerCapture(e.pointerId);
    var p = pos(e);
    ctx.beginPath();
@@ -800,9 +813,17 @@ PAGE = """
    e.preventDefault();
  });
  pad.addEventListener('pointermove', function(e){ stroke(e); e.preventDefault(); });
- ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
-   pad.addEventListener(ev, function(){ drawing = false; });
+ // pointerleave は入れない。setPointerCapture しているので枠の外へ出ても
+ // 描き続けられるのに、これがあると縁をかすめただけで線が途切れる。
+ ['pointerup','pointercancel'].forEach(function(ev){
+   pad.addEventListener(ev, endStroke);
  });
+ // 取りこぼし対策。キャンバス外でボタンを離したときもここで確実に終わる。
+ window.addEventListener('pointerup', endStroke);
+ // 選択とドラッグ&ドロップの既定動作を明示的に殺す
+ pad.addEventListener('selectstart', function(e){ e.preventDefault(); });
+ pad.addEventListener('dragstart',   function(e){ e.preventDefault(); });
+ pad.addEventListener('contextmenu', function(e){ e.preventDefault(); });
 
  var msg = document.getElementById('pad-msg');
  document.getElementById('send').onclick = function(){
