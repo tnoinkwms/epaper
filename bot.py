@@ -17,6 +17,12 @@ bot.py - Discordに投稿された画像をe-Paperへ流す中継Bot
   ALLOWED_USER_IDS    使用を許可するDiscordユーザーID。カンマ区切り。★必須
   ALLOWED_CHANNEL_IDS 反応するチャンネルID。カンマ区切り。空なら全チャンネル
   POST_TEXT           1 ならテキスト投稿も /text に流す (既定 0)
+  SEND_PREVIEW        1 なら実際の表示結果を画像で返信する (既定 1)
+  PREVIEW_SCALE       プレビューの拡大率。既定 2
+  DEFAULT_COLOR       既定の発色。bw(白黒) か color(4色)。既定 bw
+
+画像と一緒に「カラー」「白黒」などと書いて送ると、その投稿だけ発色を
+変えられる。何も書かなければ DEFAULT_COLOR が使われる。
 """
 
 import io
@@ -26,6 +32,7 @@ import logging
 
 import aiohttp
 import discord
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -53,6 +60,25 @@ EPD_PASS     = os.environ.get("EPD_PASS", "")
 ALLOWED_USERS    = _ids("ALLOWED_USER_IDS")
 ALLOWED_CHANNELS = _ids("ALLOWED_CHANNEL_IDS")
 POST_TEXT    = os.environ.get("POST_TEXT", "0") == "1"
+SEND_PREVIEW = os.environ.get("SEND_PREVIEW", "1") == "1"
+DEFAULT_BW   = os.environ.get("DEFAULT_COLOR", "bw").strip().lower() != "color"
+
+# キャプションで発色を切り替えるための語。部分一致で見る。
+# 4色パネルなので「カラー」は黒白黄赤の4色という意味。
+COLOR_WORDS = ("カラー", "color", "4色", "4color", "フルカラー")
+BW_WORDS    = ("白黒", "しろくろ", "モノクロ", "mono", "bw", "グレースケール")
+
+
+def pick_color(caption):
+    """キャプションから (bwにするか, 表示用の名前) を決める"""
+    t = (caption or "").lower()
+    # 明示指定を既定より優先する。両方書かれていたらカラーを採る。
+    if any(w.lower() in t for w in COLOR_WORDS):
+        return False, "4色"
+    if any(w.lower() in t for w in BW_WORDS):
+        return True, "白黒"
+    return DEFAULT_BW, ("白黒" if DEFAULT_BW else "4色")
+PREVIEW_SCALE = max(1, min(4, int(os.environ.get("PREVIEW_SCALE", "2") or 2)))
 
 # Discordの添付上限に合わせた保険。サーバ側で縮小するので大きい必要はない。
 MAX_BYTES = 20 * 1024 * 1024
@@ -86,12 +112,11 @@ def auth():
     return aiohttp.BasicAuth(EPD_USER, EPD_PASS) if EPD_PASS else None
 
 
-async def push_image(data: bytes, filename: str) -> tuple[bool, str]:
+async def push_image(data: bytes, filename: str, bw: bool = True) -> tuple[bool, str]:
     """/image へ中継する。戻り値は (成功したか, 表示用メッセージ)"""
     form = aiohttp.FormData()
     form.add_field("file", io.BytesIO(data), filename=filename or "upload.png")
-    # Web UI の既定値に合わせる。ここを変えるより server.py 側を直す方がよい。
-    form.add_field("color", "bw")
+    form.add_field("color", "bw" if bw else "color")
     form.add_field("dither", "on")
     form.add_field("auto", "on")
     try:
@@ -145,6 +170,56 @@ async def selftest():
         log.error("認証確認に失敗: %s", e)
 
 
+async def fetch_preview():
+    """サーバが持っている「実際に表示される画像」を取ってくる。
+
+    /preview.png は減色・ディザリング・明るさ補正まで通した後の姿なので、
+    投稿した元画像ではなく、パネルに出るものがそのまま見られる。
+    失敗しても本筋ではないので、例外は握りつぶして None を返す。
+    """
+    try:
+        t = aiohttp.ClientTimeout(total=30)
+        async with _session.get(f"{EPD_URL}/preview.png", auth=auth(), timeout=t) as r:
+            if r.status != 200:
+                log.info("プレビュー取得できず: %s", r.status)
+                return None
+            raw = await r.read()
+    except Exception as e:
+        log.info("プレビュー取得に失敗: %s", e)
+        return None
+
+    if PREVIEW_SCALE == 1:
+        return raw
+    # 240x416 はDiscord上で小さく、拡大表示されると網点が潰れて
+    # 実機と違う見え方になる。最近傍で整数倍して点を保つ。
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im = im.resize((im.width * PREVIEW_SCALE, im.height * PREVIEW_SCALE),
+                       Image.NEAREST)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        log.info("プレビューの拡大に失敗、原寸で返す: %s", e)
+        return raw
+
+
+async def reply_preview(message, mode=None):
+    if not SEND_PREVIEW:
+        return
+    png = await fetch_preview()
+    if png is None:
+        return
+    label = f"この内容で表示します ({mode})" if mode else "この内容で表示します"
+    try:
+        await message.reply(
+            label,
+            file=discord.File(io.BytesIO(png), filename="preview.png"),
+            mention_author=False)
+    except discord.HTTPException as e:
+        log.info("プレビューの返信に失敗: %s", e)
+
+
 @client.event
 async def on_ready():
     global _session
@@ -155,6 +230,10 @@ async def on_ready():
     log.info("対象チャンネル: %s", sorted(ALLOWED_CHANNELS) or "(全部)")
     log.info("中継先: %s (認証=%s)", EPD_URL, bool(EPD_PASS))
     log.info("テキスト投稿の中継: %s", "有効" if POST_TEXT else "無効 (POST_TEXT=1 で有効)")
+    log.info("プレビュー返信: %s (拡大 x%d)",
+             "有効" if SEND_PREVIEW else "無効", PREVIEW_SCALE)
+    log.info("既定の発色: %s (キャプションに「カラー」「白黒」で切替)",
+             "白黒" if DEFAULT_BW else "4色")
     await selftest()
 
 
@@ -215,8 +294,10 @@ async def on_message(message: discord.Message):
         except discord.HTTPException as e:
             await message.reply(f"Discordから画像を取得できませんでした: {e}")
             return
-        ok, err = await push_image(data, a.filename)
+        bw, mode = pick_color(message.content)
+        ok, err = await push_image(data, a.filename, bw)
     else:
+        mode = None
         ok, err = await push_text(message.content.strip())
 
     try:
@@ -225,8 +306,10 @@ async def on_message(message: discord.Message):
         pass
     if not ok:
         await message.reply(err)
-    else:
-        log.info("反映: %s が投稿", message.author)
+        return
+
+    log.info("反映: %s が投稿 (%s)", message.author, mode or "テキスト")
+    await reply_preview(message, mode)
 
 
 def main():
