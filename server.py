@@ -560,6 +560,40 @@ def quantize(img, dither, bw=False):
 
 
 # ---------------------------------------------------------------------
+# 手書きキャンバス専用の減色
+#
+# キャンバスにはパレットちょうどの色と、それが白と混ざったアンチエイリアスの
+# 中間色しか現れない。素直に最近傍で4色へ落とすと、黒線の輪郭(灰色)が
+# 「赤」になる。RGB空間では灰色73..158が赤(190,45,40)に最も近いため。
+#
+# そこで彩度を見る。彩度の低い画素は輝度だけで黒か白に振り、
+# 彩度のある画素だけ黄・赤を含めた最近傍を取る。
+# これで黒線の縁は黒か白にしかならず、赤・黄の線は色を保つ。
+# ---------------------------------------------------------------------
+SAT_THRESHOLD = 56      # これ未満の彩度は「無彩色」とみなす
+
+
+def snap_drawing(rgb_img):
+    px = rgb_img.load()
+    w, h = rgb_img.size
+    out = Image.new("RGB", (w, h))
+    opx = out.load()
+    chroma = [(rgb, code) for rgb, code in PALETTE if rgb not in ((0, 0, 0), (255, 255, 255))]
+
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if max(r, g, b) - min(r, g, b) < SAT_THRESHOLD:
+                # 無彩色。輝度(ITU-R BT.601)で黒か白へ
+                opx[x, y] = (0, 0, 0) if (r * 299 + g * 587 + b * 114) < 128000 else (255, 255, 255)
+            else:
+                best = min(PALETTE,
+                           key=lambda e: (r - e[0][0]) ** 2 + (g - e[0][1]) ** 2 + (b - e[0][2]) ** 2)
+                opx[x, y] = best[0]
+    return out
+
+
+# ---------------------------------------------------------------------
 # パッキング: 2bit/pixel、1バイトに左から4ピクセル(上位ビットが左)
 # ---------------------------------------------------------------------
 def pack(rgb_img):
@@ -683,6 +717,9 @@ PAGE = """
  .pad-tools{display:flex;gap:6px;justify-content:center;margin:10px 0;flex-wrap:wrap}
  .pad-tools button{padding:7px 12px}
  .pad-tools .sep{width:1px;background:var(--line);margin:2px 4px}
+ .pad-tools .sw{width:30px;height:30px;padding:0;border-radius:8px;
+                border:1px solid var(--line)}
+ .pad-tools .sw[aria-pressed="true"]{outline:2px solid var(--accent);outline-offset:2px}
  button:disabled{opacity:.35;cursor:default}
  button:disabled:hover{background:transparent}
 </style>
@@ -716,7 +753,13 @@ PAGE = """
     <h2>手書き</h2>
     <canvas id="pad" width="480" height="832"></canvas>
     <div class="pad-tools">
-     <button type="button" class="ghost" id="pen" aria-pressed="true">ペン</button>
+     <button type="button" class="sw" data-c="#000000" aria-pressed="true"
+             style="background:#000000" title="黒"></button>
+     <button type="button" class="sw" data-c="#BE2D28" aria-pressed="false"
+             style="background:#BE2D28" title="赤"></button>
+     <button type="button" class="sw" data-c="#E6BE00" aria-pressed="false"
+             style="background:#E6BE00" title="黄"></button>
+     <span class="sep"></span>
      <button type="button" class="ghost w" data-w="4" aria-pressed="false">細</button>
      <button type="button" class="ghost w" data-w="6" aria-pressed="false">中</button>
      <button type="button" class="ghost w" data-w="9" aria-pressed="true">太</button>
@@ -776,7 +819,9 @@ PAGE = """
  var pad = document.getElementById('pad');
  var ctx = pad.getContext('2d');
  var ERASER_W = 34;
- var mode = 'pen', penW = 9, drawing = false;
+ // 色はパネルのパレットと完全に同じ値にしてある。ずれていると
+ // サーバ側の減色で別の色に寄ってしまう。
+ var mode = 'pen', penW = 9, penColor = '#000000', drawing = false;
 
  // 履歴はビットマップではなく「線そのもの」で持つ。
  // 480x832のImageDataは1枚あたり約1.6MBあり、数十手ぶん抱えるとスマホで
@@ -791,7 +836,7 @@ PAGE = """
    }
    ctx.lineCap = 'round';
    ctx.lineJoin = 'round';
-   ctx.strokeStyle = (s.mode === 'pen') ? '#000' : '#fff';
+   ctx.strokeStyle = (s.mode === 'pen') ? s.c : '#ffffff';
    ctx.lineWidth = s.w;
    ctx.beginPath();
    ctx.moveTo(s.pts[0][0], s.pts[0][1]);
@@ -814,8 +859,17 @@ PAGE = """
 
  function setMode(m){
    mode = m;
-   document.getElementById('pen').setAttribute('aria-pressed', m === 'pen');
    document.getElementById('eraser').setAttribute('aria-pressed', m === 'eraser');
+   var sw = document.querySelectorAll('.pad-tools .sw');
+   for(var i = 0; i < sw.length; i++){
+     // ペンのときだけ、選んでいる色を光らせる
+     sw[i].setAttribute('aria-pressed',
+       m === 'pen' && sw[i].dataset.c.toLowerCase() === penColor.toLowerCase());
+   }
+ }
+ function setColor(c){
+   penColor = c;
+   setMode('pen');          // 色を選んだらペンに戻る
  }
  function setWidth(w){
    penW = w;
@@ -825,12 +879,15 @@ PAGE = """
    }
    setMode('pen');          // 太さを選んだらペンに戻すのが自然
  }
- document.getElementById('pen').onclick    = function(){ setMode('pen'); };
  document.getElementById('eraser').onclick = function(){ setMode('eraser'); };
  (function(){
    var bs = document.querySelectorAll('.pad-tools .w');
    for(var i = 0; i < bs.length; i++){
      (function(b){ b.onclick = function(){ setWidth(Number(b.dataset.w)); }; })(bs[i]);
+   }
+   var sw = document.querySelectorAll('.pad-tools .sw');
+   for(var i = 0; i < sw.length; i++){
+     (function(b){ b.onclick = function(){ setColor(b.dataset.c); }; })(sw[i]);
    }
  })();
 
@@ -867,10 +924,11 @@ PAGE = """
            (e.clientY - r.top)  * pad.height / r.height];
  }
  function beginStroke(p){
-   current = {mode: mode, w: (mode === 'pen') ? penW : ERASER_W, pts: [p]};
+   current = {mode: mode, c: penColor,
+              w: (mode === 'pen') ? penW : ERASER_W, pts: [p]};
    ctx.lineCap = 'round';
    ctx.lineJoin = 'round';
-   ctx.strokeStyle = (mode === 'pen') ? '#000' : '#fff';
+   ctx.strokeStyle = (mode === 'pen') ? penColor : '#ffffff';
    ctx.lineWidth = current.w;
    ctx.beginPath();
    ctx.moveTo(p[0], p[1]);
@@ -997,8 +1055,9 @@ def post_draw():
     if img.size != (CANVAS_W, CANVAS_H):
         img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
 
-    # 手書きは黒一色。ディザリングすると線が網点に割れるので掛けない。
-    publish(quantize(img, dither=False, bw=True))
+    # 手書きは面ではなく線なので、ディザリングは掛けない(網点に割れる)。
+    # 4色を使うため、黒線の縁が赤くならない専用の減色を通す。
+    publish(snap_drawing(img))
     return "", 204
 
 
