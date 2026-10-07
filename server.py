@@ -680,7 +680,11 @@ PAGE = """
  /* キャンバスの外へドラッグが抜けたときに、周りの文字が選択されるのを防ぐ。
     描いている間だけ付ける。 */
  body.drawing,body.drawing *{-webkit-user-select:none;user-select:none}
- .pad-tools{display:flex;gap:8px;justify-content:center;margin:12px 0}
+ .pad-tools{display:flex;gap:6px;justify-content:center;margin:10px 0;flex-wrap:wrap}
+ .pad-tools button{padding:7px 12px}
+ .pad-tools .sep{width:1px;background:var(--line);margin:2px 4px}
+ button:disabled{opacity:.35;cursor:default}
+ button:disabled:hover{background:transparent}
 </style>
 <body>
 <div class="wrap">
@@ -713,7 +717,15 @@ PAGE = """
     <canvas id="pad" width="480" height="832"></canvas>
     <div class="pad-tools">
      <button type="button" class="ghost" id="pen" aria-pressed="true">ペン</button>
+     <button type="button" class="ghost w" data-w="4" aria-pressed="false">細</button>
+     <button type="button" class="ghost w" data-w="6" aria-pressed="false">中</button>
+     <button type="button" class="ghost w" data-w="9" aria-pressed="true">太</button>
+     <span class="sep"></span>
      <button type="button" class="ghost" id="eraser" aria-pressed="false">消しゴム</button>
+    </div>
+    <div class="pad-tools">
+     <button type="button" class="ghost" id="undo" disabled>戻る</button>
+     <button type="button" class="ghost" id="redo" disabled>進む</button>
      <button type="button" class="ghost" id="clear">全消去</button>
     </div>
     <div style="text-align:center">
@@ -763,22 +775,90 @@ PAGE = """
 (function(){
  var pad = document.getElementById('pad');
  var ctx = pad.getContext('2d');
- var mode = 'pen', drawing = false;
+ var ERASER_W = 34;
+ var mode = 'pen', penW = 9, drawing = false;
 
- function clearPad(){
+ // 履歴はビットマップではなく「線そのもの」で持つ。
+ // 480x832のImageDataは1枚あたり約1.6MBあり、数十手ぶん抱えるとスマホで
+ // 苦しい。線の配列なら数KBで済み、やり直しは描き直すだけでよい。
+ var strokes = [], redoStack = [], current = null;
+
+ function paint(s){
+   if(s.mode === 'clear'){
+     ctx.fillStyle = '#fff';
+     ctx.fillRect(0, 0, pad.width, pad.height);
+     return;
+   }
+   ctx.lineCap = 'round';
+   ctx.lineJoin = 'round';
+   ctx.strokeStyle = (s.mode === 'pen') ? '#000' : '#fff';
+   ctx.lineWidth = s.w;
+   ctx.beginPath();
+   ctx.moveTo(s.pts[0][0], s.pts[0][1]);
+   // 1点だけの筆跡(タップ)は、同じ座標へlineToすると丸キャップで点が出る
+   if(s.pts.length === 1) ctx.lineTo(s.pts[0][0], s.pts[0][1]);
+   else for(var i = 1; i < s.pts.length; i++) ctx.lineTo(s.pts[i][0], s.pts[i][1]);
+   ctx.stroke();
+ }
+ function redraw(){
    ctx.fillStyle = '#fff';
    ctx.fillRect(0, 0, pad.width, pad.height);
+   for(var i = 0; i < strokes.length; i++) paint(strokes[i]);
  }
- clearPad();
+ function updateButtons(){
+   document.getElementById('undo').disabled = (strokes.length === 0);
+   document.getElementById('redo').disabled = (redoStack.length === 0);
+ }
+ redraw();
+ updateButtons();
 
  function setMode(m){
    mode = m;
    document.getElementById('pen').setAttribute('aria-pressed', m === 'pen');
    document.getElementById('eraser').setAttribute('aria-pressed', m === 'eraser');
  }
- document.getElementById('pen').onclick = function(){ setMode('pen'); };
+ function setWidth(w){
+   penW = w;
+   var bs = document.querySelectorAll('.pad-tools .w');
+   for(var i = 0; i < bs.length; i++){
+     bs[i].setAttribute('aria-pressed', Number(bs[i].dataset.w) === w);
+   }
+   setMode('pen');          // 太さを選んだらペンに戻すのが自然
+ }
+ document.getElementById('pen').onclick    = function(){ setMode('pen'); };
  document.getElementById('eraser').onclick = function(){ setMode('eraser'); };
+ (function(){
+   var bs = document.querySelectorAll('.pad-tools .w');
+   for(var i = 0; i < bs.length; i++){
+     (function(b){ b.onclick = function(){ setWidth(Number(b.dataset.w)); }; })(bs[i]);
+   }
+ })();
+
+ function undo(){
+   if(!strokes.length) return;
+   redoStack.push(strokes.pop());
+   redraw(); updateButtons();
+ }
+ function redo(){
+   if(!redoStack.length) return;
+   strokes.push(redoStack.pop());
+   redraw(); updateButtons();
+ }
+ function clearPad(){
+   // 全消去も履歴に積む。戻るで取り消せる方が事故が怖くない。
+   strokes.push({mode:'clear'});
+   redoStack.length = 0;
+   redraw(); updateButtons();
+ }
+ document.getElementById('undo').onclick  = undo;
+ document.getElementById('redo').onclick  = redo;
  document.getElementById('clear').onclick = clearPad;
+
+ document.addEventListener('keydown', function(e){
+   if(!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z') return;
+   e.preventDefault();
+   if(e.shiftKey) redo(); else undo();
+ });
 
  // 表示サイズとキャンバスの内部解像度は違うので、座標を換算する
  function pos(e){
@@ -786,13 +866,21 @@ PAGE = """
    return [(e.clientX - r.left) * pad.width / r.width,
            (e.clientY - r.top)  * pad.height / r.height];
  }
- function stroke(e){
-   if(!drawing) return;
-   var p = pos(e);
+ function beginStroke(p){
+   current = {mode: mode, w: (mode === 'pen') ? penW : ERASER_W, pts: [p]};
    ctx.lineCap = 'round';
    ctx.lineJoin = 'round';
    ctx.strokeStyle = (mode === 'pen') ? '#000' : '#fff';
-   ctx.lineWidth  = (mode === 'pen') ? 9 : 34;
+   ctx.lineWidth = current.w;
+   ctx.beginPath();
+   ctx.moveTo(p[0], p[1]);
+   ctx.lineTo(p[0], p[1]);
+   ctx.stroke();
+   ctx.beginPath();
+   ctx.moveTo(p[0], p[1]);
+ }
+ function extendStroke(p){
+   current.pts.push(p);
    ctx.lineTo(p[0], p[1]);
    ctx.stroke();
    ctx.beginPath();
@@ -801,18 +889,25 @@ PAGE = """
  function endStroke(){
    drawing = false;
    document.body.classList.remove('drawing');
+   // pointerup はパネルとwindowの両方から飛んでくるので、二重に積まない
+   if(current){
+     strokes.push(current);
+     redoStack.length = 0;   // 新しく描いたら「進む」は無効になる
+     current = null;
+     updateButtons();
+   }
  }
  pad.addEventListener('pointerdown', function(e){
    drawing = true;
    document.body.classList.add('drawing');
    pad.setPointerCapture(e.pointerId);
-   var p = pos(e);
-   ctx.beginPath();
-   ctx.moveTo(p[0], p[1]);
-   stroke(e);
+   beginStroke(pos(e));
    e.preventDefault();
  });
- pad.addEventListener('pointermove', function(e){ stroke(e); e.preventDefault(); });
+ pad.addEventListener('pointermove', function(e){
+   if(drawing) extendStroke(pos(e));
+   e.preventDefault();
+ });
  // pointerleave は入れない。setPointerCapture しているので枠の外へ出ても
  // 描き続けられるのに、これがあると縁をかすめただけで線が途切れる。
  ['pointerup','pointercancel'].forEach(function(ev){
