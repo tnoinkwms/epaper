@@ -25,6 +25,7 @@ Railway(常設運用):
   EPD_USER      Basic認証のユーザ名 (既定 epd)
   EPD_PASS      Basic認証のパスワード。空なら認証なし
   POLL_HOLD_S   /wait が変化を待つ最大秒数 (既定 25)
+  HISTORY_MAX   送ったものを残す枚数 (既定 60、0で保存しない)
 
 エンドポイント:
   GET  /            設定用のWebフォーム
@@ -32,6 +33,9 @@ Railway(常設運用):
   POST /image       画像ファイルを登録
   POST /draw        手書きキャンバスのPNGを登録
   GET  /preview.png 現在のフレームのプレビュー画像
+  GET  /history/<名前>        履歴の1枚
+  POST /history/<名前>/show   履歴の1枚をもう一度表示する
+  POST /history/<名前>/delete 履歴の1枚を消す
   GET  /wait        ロングポーリング。変化があるまで最大 POLL_HOLD_S 秒待つ
   GET  /version     現在のフレームのハッシュ(ESP32が差分判定に使う)
   GET  /frame.bin   24,960バイトの生フレームデータ
@@ -187,6 +191,12 @@ DATA_DIR     = Path(os.environ.get("DATA_DIR", str(HERE / "data")))
 FRAME_FILE   = DATA_DIR / "frame.bin"
 PREVIEW_FILE = DATA_DIR / "preview.png"
 
+# 送ったものを履歴として残す枚数。0で保存しない。
+# Volumeを付けていないと再デプロイで消えるので、残したいなら
+# DEPLOY.md の手順で /data にVolumeを付けておくこと。
+HISTORY_DIR = DATA_DIR / "history"
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "60"))
+
 # 1フレームの正しいバイト数。復元時の検証に使う。
 FRAME_BYTES = (PANEL_W // 4) * PANEL_H
 
@@ -270,6 +280,55 @@ def persist(frame, preview):
     except OSError as e:
         # 保存できなくても配信自体は続けられる。落とさない。
         print(f"persist failed: {e}")
+
+
+# 履歴ファイル名は「日時_version.png」で固定する。
+# 外から来た名前をそのままパスに繋ぐと上位ディレクトリへ抜けられるので、
+# 必ずこの形に一致するものだけを受け付ける。
+HISTORY_NAME = re.compile(r"^\d{8}-\d{6}_[0-9a-f]{16}\.png$")
+
+
+def history_list():
+    """新しい順にファイル名を返す"""
+    try:
+        names = [f.name for f in HISTORY_DIR.iterdir()
+                 if HISTORY_NAME.match(f.name)]
+    except OSError:
+        return []
+    return sorted(names, reverse=True)
+
+
+def history_path(name):
+    """検証済みのパスを返す。不正な名前なら None"""
+    if not HISTORY_NAME.match(name or ""):
+        return None
+    path = HISTORY_DIR / name
+    # 念のため実体パスでも確認する
+    try:
+        if path.resolve().parent != HISTORY_DIR.resolve():
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def save_history(preview, version):
+    """表示した内容を履歴に残す。古いものから間引く。"""
+    if HISTORY_MAX <= 0 or preview is None:
+        return
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        names = history_list()
+        # 同じ内容を続けて出したときに増やさない
+        if names and names[0].endswith(f"_{version}.png"):
+            return
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}_{version}.png"
+        _atomic_write(HISTORY_DIR / name, preview)
+        for old_name in (names + [name])[HISTORY_MAX:]:
+            (HISTORY_DIR / old_name).unlink(missing_ok=True)
+    except OSError as e:
+        # 履歴は付加機能。失敗しても表示は続ける。
+        print(f"history save failed: {e}")
 
 
 def restore():
@@ -637,6 +696,7 @@ def publish(rgb_img):
 
     # ディスクI/Oもロックの外。待っている /wait を止めない。
     persist(frame, preview)
+    save_history(preview, version)
     print(f"published: {len(frame)} bytes, version={version}")
 
 
@@ -703,6 +763,14 @@ PAGE = """
          border-radius:10px;line-height:0;max-width:100%}
  .screen img{width:200px;max-width:100%;height:auto;image-rendering:pixelated}
  .empty{color:var(--muted);font-size:13px;padding:40px 0}
+ .hist{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:12px}
+ .hist figure{margin:0;text-align:center}
+ .hist img{width:100%;aspect-ratio:240/416;object-fit:contain;background:#fff;
+           border:1px solid var(--line);border-radius:6px;image-rendering:pixelated}
+ .hist figcaption{font-size:11px;color:var(--muted);margin:4px 0 2px;
+                  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ .hist .acts{display:flex;gap:4px;justify-content:center}
+ .hist .acts button{padding:3px 8px;font-size:12px;font-weight:500}
  /* touch-action:none で指のスクロール、user-select:none でドラッグ選択を止める。
     pointerdown の preventDefault だけでは選択は止まらない。Pointer Events の
     仕様上、pointerdown を打ち消しても互換の mousedown は発生し、
@@ -799,6 +867,28 @@ PAGE = """
      <small>自動調整をオンにすると、上の2つは画像ごとに計算した値で上書きされます。</small>
      <div class="row"><button class="primary">送信</button></div>
     </form>
+   </section>
+
+   <section class="card">
+    <h2>履歴</h2>
+    {% if history %}
+    <div class="hist">
+     {% for h in history %}
+     <figure>
+      <img src="/history/{{ h }}" alt="{{ h }}" loading="lazy">
+      <figcaption>{{ h[4:6] }}/{{ h[6:8] }} {{ h[9:11] }}:{{ h[11:13] }}</figcaption>
+      <div class="acts">
+       <form method="post" action="/history/{{ h }}/show">
+        <button class="ghost">表示</button></form>
+       <form method="post" action="/history/{{ h }}/delete">
+        <button class="ghost">削除</button></form>
+      </div>
+     </figure>
+     {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">まだ履歴がありません</div>
+    {% endif %}
    </section>
 
   </div>
@@ -998,6 +1088,7 @@ PAGE = """
 @app.route("/")
 def index():
     return render_template_string(PAGE,
+                                  history=history_list(),
                                   version=_current_version,
                                   has_preview=_current_preview is not None)
 
@@ -1105,6 +1196,37 @@ def frame():
     resp = Response(data, mimetype="application/octet-stream")
     resp.headers["X-Frame-Version"] = version
     return resp
+
+
+@app.route("/history/<name>")
+def history_image(name):
+    path = history_path(name)
+    if path is None or not path.exists():
+        return "not found", 404
+    return send_file(path, mimetype="image/png")
+
+
+@app.route("/history/<name>/show", methods=["POST"])
+def history_show(name):
+    """履歴の1枚をもう一度パネルに出す。
+
+    保存してあるのは減色済みの画像なので、読み直して publish するだけで
+    元と同じフレームになる。再度の減色は掛からない。
+    """
+    path = history_path(name)
+    if path is None or not path.exists():
+        return "not found", 404
+    publish(Image.open(path).convert("RGB"))
+    return index()
+
+
+@app.route("/history/<name>/delete", methods=["POST"])
+def history_delete(name):
+    path = history_path(name)
+    if path is None:
+        return "not found", 404
+    path.unlink(missing_ok=True)
+    return index()
 
 
 @app.route("/preview.png")
